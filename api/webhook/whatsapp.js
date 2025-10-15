@@ -1,5 +1,55 @@
-// Memória simples (troque por DB depois)
-const memory = new Map(); // key: wa_id, value: { name, lang, lastSeenAt }
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false } }
+);
+
+// cache opcional em memória p/ fallback
+const cache = new Map(); // key: wa_id → { wa_id, name, lang, last_seen_at }
+
+async function getContact(wa_id) {
+  try {
+    const { data, error } = await supabase
+      .from("contacts")
+      .select("*")
+      .eq("wa_id", wa_id)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (data) {
+      cache.set(wa_id, data);
+      return data;
+    }
+  } catch (e) {
+    console.error("DB_GET_CONTACT_ERR", e);
+    // fallback: cache
+    if (cache.has(wa_id)) return cache.get(wa_id);
+  }
+  return null;
+}
+
+async function upsertContact({ wa_id, name = null, lang = null, last_seen_at = null }) {
+  try {
+    const payload = { wa_id, name, lang, last_seen_at: last_seen_at || new Date().toISOString() };
+    const { data, error } = await supabase
+      .from("contacts")
+      .upsert(payload, { onConflict: "wa_id" })
+      .select()
+      .single();
+
+    if (error) throw error;
+    cache.set(wa_id, data);
+    return data;
+  } catch (e) {
+    console.error("DB_UPSERT_CONTACT_ERR", e);
+    // fallback: cache
+    const fallback = { wa_id, name, lang, last_seen_at: last_seen_at || new Date().toISOString() };
+    cache.set(wa_id, fallback);
+    return fallback;
+  }
+}
 
 const TEXTS = {
   ask_name: {
@@ -18,14 +68,25 @@ const TEXTS = {
 async function sendWhatsAppText(to, body) {
   const url = `https://graph.facebook.com/v20.0/${process.env.PHONE_NUMBER_ID}/messages`;
   const payload = { messaging_product: "whatsapp", to, type: "text", text: { body } };
-  await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.WHATSAPP_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!resp.ok) {
+      const err = await resp.text().catch(() => "");
+      console.error("WA_SEND_ERROR", resp.status, err);
+      return;
+    }
+    const ok = await resp.json().catch(() => ({}));
+    console.log("WA_SEND_OK", ok);
+  } catch (e) {
+    console.error("WA_SEND_EXCEPTION", e);
+  }
 }
 
 // -------- detecção de idioma com fallback local
@@ -153,44 +214,46 @@ export default async function handler(req, res) {
         const text = msg.text?.body || "";
         const type = msg.type;
 
-        // Carrega/Cria perfil em memória
-        let profile = memory.get(from) || { id: from, name: null, lang: null, lastSeenAt: null };
-        profile.lastSeenAt = new Date().toISOString();
+// Carrega/Cria perfil persistente
+let profile = await getContact(from);
+if (!profile) {
+  profile = { wa_id: from, name: null, lang: null, last_seen_at: null };
+}
 
-        // 1) Detecta e fixa o idioma na primeira mensagem (ou quando lang estiver vazio)
-        if (!profile.lang && text) {
-          profile.lang = await detectLang(text); // "en"|"pt"|"es"
-        }
+// 1) Detecta e fixa o idioma se ainda não existir
+if (!profile.lang && text) {
+  profile.lang = await detectLang(text); // "en" | "pt" | "es"
+}
 
-        // 2) Tenta obter nome do payload (às vezes vem no contacts)
-        const maybeName = value?.contacts?.[0]?.profile?.name;
-        if (!profile.name && maybeName) profile.name = maybeName;
+// 2) Tenta obter nome do payload (às vezes vem no contacts)
+const maybeName = value?.contacts?.[0]?.profile?.name;
+if (!profile.name && maybeName) profile.name = maybeName;
 
-        // 3) Se ainda não temos nome, tente inferir quando o usuário responder com um nome simples
-        if (!profile.name) {
-          const namePattern = /^[a-zA-ZÀ-ÿ' ]{2,30}$/;
-          if (/^meu nome é\s+/i.test(text) || /^mi nombre es\s+/i.test(text) || /^my name is\s+/i.test(text) || namePattern.test(text)) {
-            const cleaned = text.replace(/^meu nome é\s+|^mi nombre es\s+|^my name is\s+/i, "").trim();
-            profile.name = cleaned.split(" ")[0];
-            await sendWhatsAppText(from, TEXTS.ack_set_name[profile.lang || "en"](profile.name));
-          } else if (type === "text" && !profile.name) {
-            // Pergunta o nome no idioma do cliente
-            await sendWhatsAppText(from, TEXTS.ask_name[profile.lang || "en"]);
-            memory.set(from, profile);
-            return res.status(200).end();
-          }
-        }
+// 3) Se ainda não temos nome, tente inferir quando o usuário responder com um nome simples
+if (!profile.name) {
+  const namePattern = /^[a-zA-ZÀ-ÿ' ]{2,30}$/;
+  if (/^meu nome é\s+/i.test(text) || /^mi nombre es\s+/i.test(text) || /^my name is\s+/i.test(text) || namePattern.test(text)) {
+    const cleaned = text.replace(/^meu nome é\s+|^mi nombre es\s+|^my name is\s+/i, "").trim();
+    profile.name = cleaned.split(" ")[0];
+    await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
+    await sendWhatsAppText(from, TEXTS.ack_set_name[profile.lang || "en"](profile.name));
+  } else if (type === "text") {
+    await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
+    await sendWhatsAppText(from, TEXTS.ask_name[profile.lang || "en"]);
+    return res.status(200).end();
+  }
+}
 
-        memory.set(from, profile);
+// Atualiza last_seen e garante persistência
+await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
 
-        // 4) Chama o agente com o idioma fixado (ou usa fallback)
-        const historySnippet = `Última msg: ${text}`;
-        const reply = await callAgent({ message: text, profile, historySnippet });
+// 4) Chama o agente com o idioma fixado (ou usa fallback)
+const historySnippet = `Última msg: ${text}`;
+const reply = await callAgent({ message: text, profile, historySnippet });
 
-        // 5) Responde ao cliente
-        await sendWhatsAppText(from, reply);
+// 5) Responde ao cliente
+await sendWhatsAppText(from, reply);
       }
-
       return res.status(200).end();
     } catch (e) {
       console.error("WEBHOOK_ERROR", e);
