@@ -109,36 +109,62 @@ export default async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    try {
-      const entry = req.body?.entry?.[0];
-      const change = entry?.changes?.[0];
-      const value = change?.value;
-      const messages = value?.messages;
+  try {
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const messages = value?.messages;
 
-      // só responde se veio mensagem de usuário
-      if (Array.isArray(messages) && messages.length > 0 && messages[0].type === "text") {
-        const from = messages[0].from; // wa_id (E.164 sem +)
-        await fetch(`https://graph.facebook.com/v20.0/${process.env.PHONE_NUMBER_ID}/messages`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${process.env.WHATSAPP_TOKEN}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            messaging_product: "whatsapp",
-            to: from,
-            type: "text",
-            text: { body: "Olá! Recebi sua mensagem ✅" }
-          })
-        });
+    if (Array.isArray(messages) && messages.length) {
+      const msg = messages[0];
+      const from = msg.from;                      // wa_id
+      const text = msg.text?.body || "";
+      const type = msg.type;
+
+      // Carrega/Cria perfil em memória
+      let profile = memory.get(from) || { id: from, name: null, lang: null, lastSeenAt: null };
+      profile.lastSeenAt = new Date().toISOString();
+
+      // 1) Detecta e fixa o idioma na primeira mensagem (ou quando lang estiver vazio)
+      if (!profile.lang && text) {
+        profile.lang = await detectLang(text); // "en"|"pt"|"es"
       }
 
-      return res.status(200).end();
-    } catch (e) {
-      console.error("WEBHOOK_ERROR", e);
-      return res.status(200).end(); // ainda devolve 200 para evitar re-tentativas
+      // 2) Tenta obter nome do payload (às vezes vem no contacts)
+      const maybeName = value?.contacts?.[0]?.profile?.name;
+      if (!profile.name && maybeName) profile.name = maybeName;
+
+      // 3) Se ainda não temos nome, tente inferir quando o usuário responder com um nome simples
+      if (!profile.name) {
+        const namePattern = /^[a-zA-ZÀ-ÿ' ]{2,30}$/;
+        if (/^meu nome é\s+/i.test(text) || /^mi nombre es\s+/i.test(text) || /^my name is\s+/i.test(text) || namePattern.test(text)) {
+          const cleaned = text.replace(/^meu nome é\s+|^mi nombre es\s+|^my name is\s+/i, "").trim();
+          profile.name = cleaned.split(" ")[0];
+          await sendWhatsAppText(from, TEXTS.ack_set_name[profile.lang || "en"](profile.name));
+        } else if (type === "text" && !profile.name) {
+          // Pergunta o nome no idioma do cliente
+          await sendWhatsAppText(from, TEXTS.ask_name[profile.lang || "en"]);
+          memory.set(from, profile);
+          return res.status(200).end();
+        }
+      }
+
+      memory.set(from, profile);
+
+      // 4) Chama o agente com o idioma fixado
+      const historySnippet = `Última msg: ${text}`;
+      const reply = await callAgent({ message: text, profile, historySnippet });
+
+      // 5) Responde ao cliente
+      await sendWhatsAppText(from, reply);
     }
+
+    return res.status(200).end();
+  } catch (e) {
+    console.error("WEBHOOK_ERROR", e);
+    return res.status(200).end(); // evita re-tentativas
   }
+}
 
   res.setHeader("Allow", "GET, POST");
   return res.status(405).end("Method Not Allowed");
