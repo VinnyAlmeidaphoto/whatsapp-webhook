@@ -1,0 +1,9 @@
+{
+  "name": "whatsapp-webhook",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "vercel dev" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4"
+  }
+}
