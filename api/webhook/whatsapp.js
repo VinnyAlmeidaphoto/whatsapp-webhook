@@ -6,20 +6,21 @@ export default async function handler(req, res) {
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      return res.status(200).send(challenge); // devolve SOMENTE o challenge
+      return res.status(200).end(challenge); // ✅ nada de sendStatus
     }
-    return res.sendStatus(403);
+    return res.status(403).end();
   }
 
   if (req.method === "POST") {
     try {
-      // Aqui chegam os eventos/mensagens do WhatsApp
-      // Ex.: console.log(JSON.stringify(req.body, null, 2));
-      return res.sendStatus(200);
+      // console.log("INCOMING", JSON.stringify(req.body));
+      return res.status(200).end(); // ✅ responde OK
     } catch (e) {
-      return res.sendStatus(500);
+      console.error("WEBHOOK_ERROR", e);
+      return res.status(500).end();
     }
   }
 
-  return res.setHeader("Allow", "GET, POST").status(405).end("Method Not Allowed");
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).end("Method Not Allowed");
 }
