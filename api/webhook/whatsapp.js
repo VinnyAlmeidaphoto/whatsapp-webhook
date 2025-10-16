@@ -264,6 +264,25 @@ Cumprimente ${name ? `“${name}”` : "o cliente pelo nome se souber"} de forma
   return defaultReply(lang, name);
 }
 
+// ======= Horário de atendimento =======
+const BUSINESS_TZ     = process.env.BUSINESS_TZ || 'America/New_York';
+const BUSINESS_START  = Number(process.env.BUSINESS_START ?? 9);   // 0–23
+const BUSINESS_END    = Number(process.env.BUSINESS_END   ?? 18);  // 0–23
+
+function hourInTZ(tz) {
+  // retorna a hora 0–23 no fuso indicado
+  return Number(new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false, hour: 'numeric'
+  }).format(new Date()));
+}
+
+function isOutsideBusinessHours() {
+  const h = hourInTZ(BUSINESS_TZ);
+  // log de diagnóstico
+  console.log('SCHEDULE', { tz: BUSINESS_TZ, start: BUSINESS_START, end: BUSINESS_END, nowHour: h });
+  return (h < BUSINESS_START) || (h >= BUSINESS_END);
+}
+
 // ---------- HANDLER ----------
 export default async function handler(req, res) {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "vinny_verify_1";
@@ -308,6 +327,18 @@ export default async function handler(req, res) {
         // nome vindo do payload de contacts
         const maybeName = value?.contacts?.[0]?.profile?.name;
         if (!profile.name && maybeName) profile.name = maybeName;
+
+        // --- Fora do horário? manda aviso e encerra ---
+if (isOutsideBusinessHours()) {
+  const ooo =
+    (profile.lang === 'pt') ? 'Nosso horário é 9h–18h (BRT). Assim que estivermos online, te respondemos. 😊' :
+    (profile.lang === 'es') ? 'Nuestro horario es 9h–18h (BRT). Te respondemos cuando estemos en línea. 😊' :
+                              'Our hours are 9am–6pm (BRT). We’ll get back to you when we’re online. 😊';
+
+  await sendWhatsAppText(from, ooo);
+  await logMessage(from, 'assistant', ooo);
+  return res.status(200).end();   // MUITO importante para não cair no agente
+}
 
         // handoff: pedido do cliente ("humano", "atendente", "human")
         if (/^(humano|atendente|human)$/i.test(text)) {
