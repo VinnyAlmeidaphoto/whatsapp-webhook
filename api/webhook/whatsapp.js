@@ -7,7 +7,7 @@ const supabase = createClient(
 );
 
 // ---------- util: horário de atendimento ----------
-const BUS_TZ    = process.env.BUSINESS_TZ    || "America/Sao_Paulo";
+const BUS_TZ    = process.env.BUSINESS_TZ    || "America/New_York";
 const BUS_START = Number(process.env.BUSINESS_START ?? 9);   // 0-23
 const BUS_END   = Number(process.env.BUSINESS_END   ?? 18);  // 0-23
 function isOpenNow() {
@@ -331,9 +331,9 @@ export default async function handler(req, res) {
         // --- Fora do horário? manda aviso e encerra ---
 if (isOutsideBusinessHours()) {
   const ooo =
-    (profile.lang === 'pt') ? 'Nosso horário é 9h–18h (BRT). Assim que estivermos online, te respondemos. 😊' :
-    (profile.lang === 'es') ? 'Nuestro horario es 9h–18h (BRT). Te respondemos cuando estemos en línea. 😊' :
-                              'Our hours are 9am–6pm (BRT). We’ll get back to you when we’re online. 😊';
+    (profile.lang === 'pt') ? 'Nosso horário é 9h–18h (EST). Assim que estivermos online, te respondemos. 😊' :
+    (profile.lang === 'es') ? 'Nuestro horario es 9h–18h (EST). Te respondemos cuando estemos en línea. 😊' :
+                              'Our hours are 9am–6pm (EST). We’ll get back to you when we’re online. 😊';
 
   await sendWhatsAppText(from, ooo);
   await logMessage(from, 'assistant', ooo);
