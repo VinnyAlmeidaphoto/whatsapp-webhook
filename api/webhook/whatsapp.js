@@ -9,6 +9,7 @@ const supabase = createClient(
 // cache opcional em memória p/ fallback
 const cache = new Map(); // key: wa_id → { wa_id, name, lang, last_seen_at }
 
+// ------------- CONTACTS -------------
 async function getContact(wa_id) {
   try {
     const { data, error } = await supabase
@@ -16,7 +17,6 @@ async function getContact(wa_id) {
       .select("*")
       .eq("wa_id", wa_id)
       .maybeSingle();
-
     if (error) throw error;
     if (data) {
       cache.set(wa_id, data);
@@ -24,7 +24,6 @@ async function getContact(wa_id) {
     }
   } catch (e) {
     console.error("DB_GET_CONTACT_ERR", e);
-    // fallback: cache
     if (cache.has(wa_id)) return cache.get(wa_id);
   }
   return null;
@@ -38,19 +37,18 @@ async function upsertContact({ wa_id, name = null, lang = null, last_seen_at = n
       .upsert(payload, { onConflict: "wa_id" })
       .select()
       .single();
-
     if (error) throw error;
     cache.set(wa_id, data);
     return data;
   } catch (e) {
     console.error("DB_UPSERT_CONTACT_ERR", e);
-    // fallback: cache
     const fallback = { wa_id, name, lang, last_seen_at: last_seen_at || new Date().toISOString() };
     cache.set(wa_id, fallback);
     return fallback;
   }
 }
 
+// ------------- TEXTOS BÁSICOS -------------
 const TEXTS = {
   ask_name: {
     pt: "Oi! Como posso te chamar? 😊 (responda com seu primeiro nome)",
@@ -64,7 +62,33 @@ const TEXTS = {
   }
 };
 
-// -------- util: envio de texto via WhatsApp Cloud API
+// ------------- HISTÓRICO (messages) -------------
+async function logMessage(wa_id, role, content) {
+  try {
+    const { error } = await supabase.from("messages").insert({ wa_id, role, content });
+    if (error) throw error;
+  } catch (e) {
+    console.error("DB_LOG_MESSAGE_ERR", e);
+  }
+}
+
+async function getRecentMessages(wa_id, limit = 6) {
+  try {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("role, content")
+      .eq("wa_id", wa_id)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    return (data || []).slice().reverse(); // cronológica
+  } catch (e) {
+    console.error("DB_GET_MESSAGES_ERR", e);
+    return [];
+  }
+}
+
+// ------------- WHATSAPP SEND -------------
 async function sendWhatsAppText(to, body) {
   const url = `https://graph.facebook.com/v20.0/${process.env.PHONE_NUMBER_ID}/messages`;
   const payload = { messaging_product: "whatsapp", to, type: "text", text: { body } };
@@ -89,16 +113,13 @@ async function sendWhatsAppText(to, body) {
   }
 }
 
-// -------- detecção de idioma com fallback local
+// ------------- DETECÇÃO DE IDIOMA -------------
 async function detectLang(text) {
   const t = (text || "").trim().toLowerCase();
-
-  // Heurística local rápida
   if (/[¿¡]/.test(t) || /\b(hola|disponibilidad|gracias|buen[oa]s|precio)\b/.test(t)) return "es";
   if (/\b(hi|hello|thanks|availability|price|book|schedule)\b/.test(t)) return "en";
   if (/\b(oi|olá|obrigad[oa]|disponibilidade|agenda|preço)\b/.test(t) || /[áâãéêíóôõúç]/.test(t)) return "pt";
 
-  // Só chama OpenAI se houver chave
   if (process.env.OPENAI_API_KEY) {
     try {
       const body = {
@@ -119,12 +140,12 @@ async function detectLang(text) {
       const data = await resp.json();
       const code = (data?.output_text || "").trim().toLowerCase();
       if (["en","pt","es"].includes(code)) return code;
-    } catch (_) { /* fallback abaixo */ }
+    } catch (_) {}
   }
-  return "en"; // default seguro
+  return "en";
 }
 
-// -------- respostas padrão por idioma (fallback)
+// ------------- REPLIES -------------
 function defaultReply(lang, name) {
   if (lang === "pt") return name ? `Oi, ${name}! Já estou verificando as opções para você. 😊`
                                 : "Recebi sua mensagem e já estou verificando as opções para você. 😊";
@@ -134,12 +155,12 @@ function defaultReply(lang, name) {
               : "Got your message — I’m checking options for you now. 😊";
 }
 
-// -------- chamada ao agente / modelo com fallback
-async function callAgent({ message, profile, historySnippet }) {
+// ------------- AGENTE (com histórico) -------------
+async function callAgent({ message, profile }) {
   const lang = profile.lang || "en";
   const name = profile.name || "";
+  const history = await getRecentMessages(profile.wa_id, 6);
 
-  // 1) Agent Builder (se você tiver AGENT_ID)
   if (process.env.AGENT_ID && process.env.OPENAI_API_KEY) {
     try {
       const resp = await fetch(`https://api.openai.com/v1/agents/${process.env.AGENT_ID}/responses`, {
@@ -150,8 +171,9 @@ async function callAgent({ message, profile, historySnippet }) {
         },
         body: JSON.stringify({
           input: message,
-          instructions: `Responda sempre em ${lang}. Se tiver nome do cliente, cumprimente pelo nome.`,
-          metadata: { customer_name: name, customer_lang: lang, history_snippet: historySnippet || "" }
+          instructions: `Responda SEMPRE em ${lang}. Cumprimente pelo nome se souber e use o contexto recente.`,
+          metadata: { customer_name: name, customer_lang: lang },
+          messages: history.map(m => ({ role: m.role, content: m.content }))
         })
       });
       const data = await resp.json();
@@ -159,18 +181,15 @@ async function callAgent({ message, profile, historySnippet }) {
     } catch (_) { return defaultReply(lang, name); }
   }
 
-  // 2) Responses API direta (modelo)
   if (process.env.OPENAI_API_KEY) {
     try {
-      const sys = `Você é um agente de suporte. Responda sempre em ${lang}. Cumprimente pelo nome se souber.`;
-      const body = {
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        input: [
-          { role: "system", content: sys },
-          { role: "user", content: `customer_name: ${name}` },
-          { role: "user", content: `message: ${message}` }
-        ]
-      };
+      const sys = `Você é um agente de suporte. Responda SEMPRE em ${lang}.
+Cumprimente ${name ? `“${name}”` : "o cliente pelo nome se souber"} de forma natural e breve. Use o histórico abaixo.`;
+      const input = [{ role: "system", content: sys }];
+      history.forEach(m => input.push({ role: m.role, content: m.content }));
+      input.push({ role: "user", content: message });
+
+      const body = { model: process.env.OPENAI_MODEL || "gpt-4o-mini", input };
       const resp = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
@@ -184,10 +203,10 @@ async function callAgent({ message, profile, historySnippet }) {
     } catch (_) { return defaultReply(lang, name); }
   }
 
-  // 3) Sem OpenAI: sempre responde algo útil
   return defaultReply(lang, name);
 }
 
+// ------------- HANDLER -------------
 export default async function handler(req, res) {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "vinny_verify_1";
 
@@ -209,56 +228,55 @@ export default async function handler(req, res) {
       const messages = value?.messages;
 
       if (Array.isArray(messages) && messages.length) {
-        const msg = messages[0];
-        const from = msg.from;               // wa_id
+        const msg  = messages[0];
+        const from = msg.from;                   // wa_id
         const text = msg.text?.body || "";
         const type = msg.type;
 
-// Carrega/Cria perfil persistente
-let profile = await getContact(from);
-if (!profile) {
-  profile = { wa_id: from, name: null, lang: null, last_seen_at: null };
-}
+        // Carrega/Cria perfil persistente
+        let profile = await getContact(from);
+        if (!profile) {
+          profile = { wa_id: from, name: null, lang: null, last_seen_at: null };
+        }
 
-// 1) Detecta e fixa o idioma se ainda não existir
-if (!profile.lang && text) {
-  profile.lang = await detectLang(text); // "en" | "pt" | "es"
-}
+        // 1) Idioma
+        if (!profile.lang && text) {
+          profile.lang = await detectLang(text); // "en" | "pt" | "es"
+        }
 
-// 2) Tenta obter nome do payload (às vezes vem no contacts)
-const maybeName = value?.contacts?.[0]?.profile?.name;
-if (!profile.name && maybeName) profile.name = maybeName;
+        // 2) Nome do payload
+        const maybeName = value?.contacts?.[0]?.profile?.name;
+        if (!profile.name && maybeName) profile.name = maybeName;
 
-// 3) Se ainda não temos nome, tente inferir quando o usuário responder com um nome simples
-if (!profile.name) {
-  const namePattern = /^[a-zA-ZÀ-ÿ' ]{2,30}$/;
-  if (/^meu nome é\s+/i.test(text) || /^mi nombre es\s+/i.test(text) || /^my name is\s+/i.test(text) || namePattern.test(text)) {
-    const cleaned = text.replace(/^meu nome é\s+|^mi nombre es\s+|^my name is\s+/i, "").trim();
-    profile.name = cleaned.split(" ")[0];
-    await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
-    await sendWhatsAppText(from, TEXTS.ack_set_name[profile.lang || "en"](profile.name));
-  } else if (type === "text") {
-    await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
-    await sendWhatsAppText(from, TEXTS.ask_name[profile.lang || "en"]);
-    return res.status(200).end();
-  }
-}
+        // 3) Inferir nome se usuário digitou
+        if (!profile.name) {
+          const namePattern = /^[a-zA-ZÀ-ÿ' ]{2,30}$/;
+          if (/^meu nome é\s+/i.test(text) || /^mi nombre es\s+/i.test(text) || /^my name is\s+/i.test(text) || namePattern.test(text)) {
+            const cleaned = text.replace(/^meu nome é\s+|^mi nombre es\s+|^my name is\s+/i, "").trim();
+            profile.name = cleaned.split(" ")[0];
+            await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
+            await sendWhatsAppText(from, TEXTS.ack_set_name[profile.lang || "en"](profile.name));
+          } else if (type === "text") {
+            await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
+            await sendWhatsAppText(from, TEXTS.ask_name[profile.lang || "en"]);
+            return res.status(200).end();
+          }
+        }
 
-// Atualiza last_seen e garante persistência
-await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
+        // 4) Persistir last_seen
+        await upsertContact({ wa_id: from, name: profile.name, lang: profile.lang, last_seen_at: new Date().toISOString() });
 
-// 4) Chama o agente com o idioma fixado (ou usa fallback)
-const historySnippet = `Última msg: ${text}`;
-const reply = await callAgent({ message: text, profile, historySnippet });
-
-// 5) Responde ao cliente
-await sendWhatsAppText(from, reply);
+        // 5) Registrar e responder usando histórico
+        await logMessage(from, "user", text);
+        const reply = await callAgent({ message: text, profile });
+        await sendWhatsAppText(from, reply);
+        await logMessage(from, "assistant", reply);
       }
+
       return res.status(200).end();
     } catch (e) {
       console.error("WEBHOOK_ERROR", e);
-      // ainda devolve 200 pra evitar re-tentativas
-      return res.status(200).end();
+      return res.status(200).end(); // evita re-tentativas
     }
   }
 
